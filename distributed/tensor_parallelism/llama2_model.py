@@ -1,13 +1,25 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
-
-from dataclasses import dataclass
-from typing import Optional, Tuple
-
+import os
+import argparse
 import torch
-import torch.nn.functional as F
-from torch import nn
+import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    CPUOffload,
+    BackwardPrefetch,
+)
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    enable_wrap,
+    wrap,
+)
 
+# 기존의 ModelArgs, precompute_freqs_cis, RMSNorm, Attention, FeedForward, 
+# TransformerBlock, Transformer 클래스들은 그대로 유지
 
 @dataclass
 class ModelArgs:
@@ -424,3 +436,88 @@ class Transformer(nn.Module):
             Transformer: Transformer model.
         """
         return cls(model_args)
+
+class SimpleDataset(Dataset):
+    def __init__(self, size=10000, seq_len=32):
+        self.size = size
+        self.seq_len = seq_len
+        
+    def __len__(self):
+        return self.size
+    
+    def __getitem__(self, idx):
+        return torch.randint(0, 32000, (self.seq_len,))
+
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
+    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '12355')
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
+
+def train(rank, world_size, args):
+    setup(rank, world_size)
+    
+    torch.cuda.set_device(rank)
+    model = Transformer(args.model_args).to(rank)
+    
+    model = DDP(model, device_ids=[rank])
+    
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    
+    dataset = SimpleDataset(size=args.dataset_size, seq_len=args.model_args.max_seq_len)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler)
+    
+    loss_fn = nn.CrossEntropyLoss()
+    
+    for epoch in range(args.num_epochs):
+        model.train()
+        sampler.set_epoch(epoch)
+        total_loss = 0
+        for batch in dataloader:
+            optimizer.zero_grad()
+            input_ids = batch.to(rank)
+            target_ids = torch.roll(input_ids, shifts=-1, dims=1)
+            target_ids[:, -1] = 0  # 마지막 토큰의 타겟은 0으로 설정
+            
+            outputs = model(input_ids)
+            loss = loss_fn(outputs.view(-1, args.model_args.vocab_size), target_ids.view(-1))
+            
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(dataloader)
+        if rank == 0:
+            print(f"Epoch {epoch+1}/{args.num_epochs}, Loss: {avg_loss:.4f}")
+    
+    if rank == 0:
+        torch.save(model.state_dict(), "distributed_llama2_model.pt")
+    
+    cleanup()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--num_epochs', type=int, default=10)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--learning_rate', type=float, default=5e-5)
+    parser.add_argument('--dataset_size', type=int, default=100000)
+    
+    args = parser.parse_args()
+    
+    args.model_args = ModelArgs(
+        dim=2048,
+        n_layers=24,
+        n_heads=16,
+        vocab_size=32000,
+        max_seq_len=1024
+    )
+    
+    world_size = torch.cuda.device_count()
+    torch.multiprocessing.spawn(train, args=(world_size, args), nprocs=world_size, join=True)
+
+if __name__ == "__main__":
+    main()
