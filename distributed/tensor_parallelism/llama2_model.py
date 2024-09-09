@@ -1,14 +1,3 @@
-from dataclasses import dataclass
-from typing import Optional, Tuple
-
-import os
-import argparse
-import torch
-import torch.nn.functional as F
-from torch import nn
-
-
-
 import os
 import argparse
 import torch
@@ -19,18 +8,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    CPUOffload,
-    BackwardPrefetch,
-)
-from torch.distributed.fsdp.wrap import (
-    size_based_auto_wrap_policy,
-    enable_wrap,
-    wrap,
-)
+from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload, BackwardPrefetch
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
-# 기존의 ModelArgs, precompute_freqs_cis, RMSNorm, Attention, FeedForward, 
-# TransformerBlock, Transformer 클래스들은 그대로 유지
+# 기존의 ModelArgs, precompute_freqs_cis, RMSNorm, Attention, FeedForward, TransformerBlock, Transformer 클래스들은 그대로 유지
 
 @dataclass
 class ModelArgs:
@@ -42,12 +23,11 @@ class ModelArgs:
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
-
     max_batch_size: int = 1
     max_seq_len: int = 1024
-    # If `True`, then each transformer block init uses its layer ID, and if
-    # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
+# 기존의 ModelArgs, precompute_freqs_cis, RMSNorm, Attention, FeedForward, 
+# TransformerBlock, Transformer 클래스들은 그대로 유지
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -471,9 +451,15 @@ def train(rank, world_size, args):
     setup(rank, world_size)
     
     torch.cuda.set_device(rank)
-    model = Transformer(args.model_args).to(rank)
     
-    model = DDP(model, device_ids=[rank])
+    # 기존 Transformer 모델 초기화 후 FSDP로 감싸기
+    model = Transformer(args.model_args).to(rank)
+    model = FSDP(
+        model, 
+        auto_wrap_policy=size_based_auto_wrap_policy,  # 크기 기반 자동 래핑 적용
+        cpu_offload=CPUOffload(offload_params=True),  # 선택사항: CPU로 파라미터 오프로드
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE
+    ).to(rank)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
@@ -506,7 +492,7 @@ def train(rank, world_size, args):
             print(f"Epoch {epoch+1}/{args.num_epochs}, Loss: {avg_loss:.4f}")
     
     if rank == 0:
-        torch.save(model.state_dict(), "distributed_llama2_model.pt")
+        torch.save(model.state_dict(), "fsdp_distributed_llama2_model.pt")
     
     cleanup()
 
