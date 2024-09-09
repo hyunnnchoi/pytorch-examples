@@ -1,3 +1,6 @@
+from dataclasses import dataclass  # 추가된 부분
+from typing import Optional, Tuple
+
 import os
 import argparse
 import torch
